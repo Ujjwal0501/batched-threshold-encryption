@@ -92,3 +92,96 @@ pub fn decrypt_all<E: Pairing>(
 
     m
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{dealer::Dealer, encryption::encrypt};
+
+    use super::*;
+    use ark_bls12_381::Bls12_381;
+    use ark_ec::bls12::Bls12;
+    use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
+
+    type E = Bls12_381;
+    type Fr = <Bls12<ark_bls12_381::Config> as Pairing>::ScalarField;
+    type G1 = <Bls12<ark_bls12_381::Config> as Pairing>::G1;
+    type G2 = <Bls12<ark_bls12_381::Config> as Pairing>::G2;
+
+    #[test]
+    fn test_encryption() {
+        let mut rng = ark_std::test_rng();
+
+        let batch_size = 1 << 5;
+        let n = 1 << 4;
+        let tx_domain = Radix2EvaluationDomain::<Fr>::new(batch_size).unwrap();
+
+        let mut dealer = Dealer::<E>::new(batch_size, n);
+        let (crs, lag_shares) = dealer.setup(&mut rng);
+        let (gtilde, htilde, com, alpha_shares, r_shares) = dealer.epoch_setup(&mut rng);
+
+        let mut msg = Vec::new();
+        for i in 0..batch_size {
+            msg.push([i as u8; 32]);
+        }
+        let x = tx_domain.group_gen;
+
+        let mut ct = Vec::new();
+        for i in 0..batch_size {
+            let cti = encrypt::<Bls12_381, _>(msg[i], x, com, htilde, crs.htau, &mut rng);
+            ct.push(cti);
+        }
+
+        let mut ct_bytes = Vec::new();
+        ct.serialize_compressed(&mut ct_bytes).unwrap();
+        println!("Compressed ciphertext: {} bytes", ct_bytes.len());
+
+        let mut ct_bytes = Vec::new();
+        ct.serialize_uncompressed(&mut ct_bytes).unwrap();
+        println!("Uncompressed ciphertext: {} bytes", ct_bytes.len());
+
+        let mut g1_bytes = Vec::new();
+        let mut g2_bytes = Vec::new();
+        let mut fr_bytes = Vec::new();
+        
+        let g = G1::generator();
+        let h = G2::generator();
+        let x = tx_domain.group_gen;
+        
+        g.serialize_compressed(&mut g1_bytes).unwrap();
+        h.serialize_compressed(&mut g2_bytes).unwrap();
+        x.serialize_compressed(&mut fr_bytes).unwrap();
+
+        println!("G1 len: {} bytes", g1_bytes.len());
+        println!("G2 len: {} bytes", g2_bytes.len());
+        println!("Fr len: {} bytes", fr_bytes.len());
+
+        for ciphertext in &ct {
+            ciphertext.verify(gtilde, htilde, &crs);
+        }
+
+        let mut secret_keys = Vec::new();
+        for i in 0..n {
+            let sk = SecretKey::<E>::new(lag_shares[i].clone(), alpha_shares[i], r_shares[i]);
+            secret_keys.push(sk);
+        }
+
+        let mut partial_decryptions1 = Vec::new();
+        let mut partial_decryptions2 = Vec::new();
+
+        for sk in &secret_keys {
+            let (pd1, pd2) = sk.partial_decrypt(&ct, gtilde, htilde, &crs);
+            partial_decryptions1.push(pd1);
+            partial_decryptions2.push(pd2);
+        }
+
+        assert_eq!(partial_decryptions1.len(), n);
+        assert_eq!(partial_decryptions2.len(), n);
+
+        let dmsg = decrypt_all(&partial_decryptions1, &partial_decryptions2, &ct, &crs);
+        println!("Decrypted message: {:?}", dmsg);
+        for i in 0..batch_size {
+            assert_eq!(dmsg[i], msg[i]);
+        }
+        println!("Decryption successful!");
+    }
+}
